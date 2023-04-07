@@ -1,3 +1,5 @@
+# 在原作的基础上修改为兼容ChatGPT API，可以直接用于为ChatGPT写的接口。还有一些很多问题，并未实现所有接口，简单对话已可以。
+
 # ChatGLM-6B流式HTTP API示例
 
 本工程仿造OpneAI Chat Completion API（即GPT3.5 API）的实现，为[ChatGLM-6B](https://github.com/THUDM/ChatGLM-6B)提供流式HTTP API。

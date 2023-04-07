@@ -5,7 +5,8 @@
 
 from gevent import monkey, pywsgi
 monkey.patch_all()
-from flask import Flask, request, Response
+from flask import Flask, Response, request
+#from chatglm_service_flask import Flask, request, Response
 from flask_cors import CORS
 import torch
 from transformers import AutoTokenizer, AutoModel
@@ -14,6 +15,10 @@ import logging
 import os
 import json
 import sys
+import time
+import hashlib
+import base64
+import pprint
 
 def getLogger(name, file_name, use_formatter=True):
     logger = logging.getLogger(name)
@@ -34,8 +39,8 @@ def getLogger(name, file_name, use_formatter=True):
 
 logger = getLogger('ChatGLM', 'chatlog.log')
 
-MAX_HISTORY = 5
-
+MAX_HISTORY = 8
+custom_charset = b'-_'
 
 def format_sse(data: str, event=None) -> str:
     msg = 'data: {}\n\n'.format(data)
@@ -43,37 +48,16 @@ def format_sse(data: str, event=None) -> str:
         msg = 'event: {}\n{}'.format(event, msg)
     return msg
 
+model_path = "THUDM/chatglm-6b-int4"
 
 class ChatGLM():
-    def __init__(self, quantize_level, gpu_id) -> None:
+    def __init__(self) -> None:
         logger.info("Start initialize model...")
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            "THUDM/chatglm-6b", trust_remote_code=True)
-        self.model = self._model(quantize_level, gpu_id)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        self.model = AutoModel.from_pretrained(model_path, trust_remote_code=True).quantize(4).half().cuda()
         self.model.eval()
         _, _ = self.model.chat(self.tokenizer, "你好", history=[])
         logger.info("Model initialization finished.")
-    
-    def _model(self, quantize_level, gpu_id):
-        model_name = "THUDM/chatglm-6b"
-        quantize = int(args.quantize)
-        tokenizer = AutoTokenizer.from_pretrained("THUDM/chatglm-6b", trust_remote_code=True)
-        model = None
-        if gpu_id == '-1':
-            if quantize == 8:
-                print('CPU模式下量化等级只能是16或4，使用4')
-                model_name = "THUDM/chatglm-6b-int4"
-            elif quantize == 4:
-                model_name = "THUDM/chatglm-6b-int4"
-            model = AutoModel.from_pretrained(model_name, trust_remote_code=True).float()
-        else:
-            gpu_ids = gpu_id.split(",");
-            self.devices = ["cuda:{}".format(id) for id in gpu_ids]
-            if quantize == 16:
-                model = AutoModel.from_pretrained(model_name, trust_remote_code=True).half().cuda()
-            else:
-                model = AutoModel.from_pretrained(model_name, trust_remote_code=True).half().quantize(quantize).cuda()
-        return model
     
     def clear(self) -> None:
         if torch.cuda.is_available():
@@ -87,18 +71,75 @@ class ChatGLM():
         history = [list(h) for h in history]
         return response, history
 
-    def stream(self, query, history):
+    def stream(self, query, history, max_tokens):
+        response_time = int(time.time())
+        # 计算 SHA-256 哈希值
+        hash_obj = hashlib.sha256(response_time.to_bytes(4, byteorder='big'))
+        hash_str = hash_obj.digest()
+
+        # 对哈希值进行 base64 编码，得到固定长度的字符串
+        encoded_data = base64.b64encode(hash_str, altchars=custom_charset)
+
+        # 将编码后的二进制数据转换为字符串类型
+        output_str = encoded_data.decode('ascii')[:30]
+        #output_str = base64.b64encode(hash_str).decode('utf-8')[:30]
+        response_id = "chatcmpl-" + output_str
+    
         if query is None or history is None:
-            yield {"query": "", "response": "", "history": [], "finished": True}
+            start_data = {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "model": "glm-6b",
+                "created": response_time,
+                "choices": [
+                    {
+                        "delta": {
+                            "role": "assistant"
+                        },
+                        "finish_reason": None,
+                        "index": 0}
+                    ],
+                }
+            yield start_data
         size = 0
         response = ""
-        for response, history in self.model.stream_chat(self.tokenizer, query, history):
+        for response, history in self.model.stream_chat(self.tokenizer, query, history, max_tokens):
             this_response = response[size:]
             history = [list(h) for h in history]
             size = len(response)
-            yield {"delta": this_response, "response": response, "finished": False}
+
+            data = {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "model": "glm-6b",
+                "created": response_time,
+                "choices": [
+                    {
+                        "delta": {
+                            "content": this_response,
+                        },
+                        "finish_reason": None,
+                        "index": 0
+                    }
+                ],                        
+            }      
+            yield data
         logger.info("Answer - {}".format(response))
-        yield {"query": query, "delta": "[EOS]", "response": response, "history": history, "finished": True}
+        data_end = {
+            "id": response_id,
+            "object": "chat.completion.chunk",
+            "model": "glm-6b",
+            "created": response_time,
+            "choices": [
+                {
+                    "delta": {},
+                    "finish_reason": "stop",
+                    "index": 0
+                }
+            ],
+        }
+        yield data_end
+        yield "[DONE]"
 
 
 def start_server(quantize_level, http_address: str, port: int, gpu_id: str):
@@ -135,27 +176,88 @@ def start_server(quantize_level, http_address: str, port: int, gpu_id: str):
         except Exception as e:
             logger.error(f"error: {e}")
         return Response(json.dumps(result, ensure_ascii=False), content_type="application/json")
-
-    @app.route("/stream", methods=["POST"])
+    
+    @app.post("/v1/moderations")
+    async def moderations():
+        return json.dumps('')
+    
+    @app.route("/v1/chat/completions", methods=["POST"])
     def answer_question_stream():
         def decorate(generator):
             for item in generator:
-                yield format_sse(json.dumps(item, ensure_ascii=False), 'delta')
+                yield format_sse(json.dumps(item, ensure_ascii=False))
+
         result = {"query": "", "response": "", "success": False}
         text, history = None, None
+        ori_history = []
+        max_tokens = 2048
         try:
             if "application/json" in request.content_type:
                 arg_dict = request.get_json()
-                text = arg_dict["query"]
-                ori_history = arg_dict["history"]
-                logger.info("Query - {}".format(text))
+
+                #pprint.pprint(arg_dict)
+                try:
+                    strem = arg_dict["stream"]
+                except:
+                    strem = None
+                if not strem:
+                    result = {"query": "", "response": "", "success": False}
+                    try:
+                        arg_dict = request.get_json()
+                        messages = arg_dict["messages"]
+                        for message in messages:
+                            content = message['content']
+
+                        for i, msg in enumerate(messages):
+                            if msg['role'] == 'user' and i+1 < len(messages):
+                                next_msg = messages[i+1]
+                                if next_msg['role'] == 'assistant':
+                                    ori_history.append((msg['content'], next_msg['content']))
+
+                        if len(ori_history) > 0:
+                            logger.info("History - {}".format(ori_history))
+                        history = ori_history[-MAX_HISTORY:]
+                        history = [tuple(h) for h in history]
+                        response, history = bot.answer(content, history)
+                        logger.info("Answer - {}".format(response))
+                        ori_history.append((content, response))
+
+                        response_time = int(time.time())
+                        result = {"id": "chatcmpl-123","object": "chat.completion","created": response_time,
+                         "choices": [{"index": 0,
+                                      "message": {"role": "assistant",
+                                                  "content": response,},
+                                                  "finish_reason": "stop"}]}
+
+                    except Exception as e:
+                        logger.error(f"error: {e}")
+                    return Response(json.dumps(result, ensure_ascii=False), content_type="application/json")
+
+                messages = arg_dict["messages"]
+                try:
+                    temperature = arg_dict["temperature"]
+                except:
+                    temperature = 1.0
+                try:
+                    max_tokens = arg_dict["max_tokens"]
+                except:
+                    max_tokens = 2048
+
+                for i, msg in enumerate(messages):
+                    if msg['role'] == 'user' and i+1 < len(messages):
+                        next_msg = messages[i+1]
+                        if next_msg['role'] == 'assistant':
+                            ori_history.append((msg['content'], next_msg['content']))
+                for message in messages:
+                    content = message['content']
+                logger.info("Query - {}".format(content))
                 if len(ori_history) > 0:
                     logger.info("History - {}".format(ori_history))
                 history = ori_history[-MAX_HISTORY:]
                 history = [tuple(h) for h in history]
         except Exception as e:
-            logger.error(f"error: {e}")
-        return Response(decorate(bot.stream(text, history)), mimetype='text/event-stream')
+            logger.error(f"error 1 : {e}")
+        return Response(decorate(bot.stream(content, history, max_tokens)), mimetype='text/event-stream')
 
     @app.route("/clear", methods=["GET", "POST"])
     def clear():
